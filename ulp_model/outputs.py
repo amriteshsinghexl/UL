@@ -1,0 +1,210 @@
+"""
+outputs.py - Output writing and reporting utilities for ULP model.
+"""
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import torch
+
+from .inputs import PolicyBatch
+
+
+# ---------------------------------------------------------------------------
+# APE computation
+# ---------------------------------------------------------------------------
+
+def compute_ape(policies: PolicyBatch) -> float:
+    """Compute Annual Premium Equivalent (APE) for the policy batch.
+
+    Rules:
+    - Non-single-pay (prem_term > 1 OR prem_freq != 12/annual):
+        100% of ACP * init_pols_if
+    - Single-pay (prem_term == 1 AND prem_freq == 12/annual):
+        10% of ACP * init_pols_if
+    - Top-up premium: always 10% of ATP * init_pols_if
+    """
+    is_single_pay = (
+        (policies.prem_term == 1)
+        & (policies.prem_freq == 12)
+    )
+    basic_factor = torch.where(
+        is_single_pay,
+        torch.full_like(policies.acp, 0.10),
+        torch.full_like(policies.acp, 1.00),
+    )
+    basic_ape = (basic_factor * policies.acp * policies.init_pols_if).sum().item()
+    topup_ape = (0.10 * policies.atp * policies.init_pols_if).sum().item()
+    return basic_ape + topup_ape
+
+
+# ---------------------------------------------------------------------------
+# Console metrics
+# ---------------------------------------------------------------------------
+
+def compute_metrics(summary_data: dict, ape: float) -> dict[str, float]:
+    """Compute metrics used by console and summary reporting."""
+    def _t0(key: str) -> float:
+        if key in summary_data:
+            v = summary_data[key]
+            return float(v[0]) if v.ndim >= 1 else float(v)
+        return float("nan")
+
+    def _total(key: str) -> float:
+        if key in summary_data:
+            return float(summary_data[key].sum())
+        return float("nan")
+
+    pv_cf = _t0("pv_cf_after_scr")
+    pv_prem = _t0("pv_prem_inc")
+    # total_prem = _total("prem_inc_if")
+    # total_death = _total("death_outgo")
+    # total_surr = _total("surr_outgo")
+
+    pvcf_over_ape = pv_cf / ape if ape != 0.0 else float("nan")
+    pvcf_over_pv_prem = pv_cf / pv_prem if pv_prem != 0.0 and math.isfinite(pv_prem) else float("nan")
+    return {
+        "pv_cf": pv_cf,
+        "pv_prem": pv_prem,
+        "pvcf_over_ape": pvcf_over_ape,
+        "pvcf_over_pv_prem": pvcf_over_pv_prem,
+    }
+
+
+def print_metrics(
+    summary_data: dict,
+    scenario_id: int,
+    elapsed_time: float,
+    policies: "PolicyBatch | None" = None,
+    ape: "float | None" = None,
+) -> None:
+    """Print a concise summary of key projection metrics.
+ 
+    Parameters
+    ----------
+    summary_data  : portfolio-level summary dict (keys -> [T] tensors)
+    scenario_id   : integer scenario label for the header line
+    elapsed_time  : wall-clock seconds to display
+    policies      : PolicyBatch -- used to compute APE when ape is not supplied
+    ape           : pre-computed APE float (from run_portfolio); if given,
+                    policies is not needed and may be None
+    """
+    if ape is None:
+        if policies is None:
+            raise ValueError("Either 'ape' or 'policies' must be supplied to print_metrics.")
+        ape = compute_ape(policies)
+
+    metrics = compute_metrics(summary_data, ape)
+
+    pv_cf = metrics["pv_cf"]
+    pv_prem = metrics["pv_prem"]
+    pvcf_over_ape = metrics["pvcf_over_ape"]
+    pvcf_over_pv_prem = metrics["pvcf_over_pv_prem"]
+
+    print(f"\n{'='*60}")
+    print(f" Scenario {scenario_id:>4d} | Elapsed: {elapsed_time:.2f}s")
+    print(f"{'='*60}")
+    print(f"  APE                : {ape:>20,.0f}")
+    print(f"  PV Cashflow (t=0)  : {pv_cf:>20,.0f}")
+    print(f"  PV Prem Inc (t=0)  : {pv_prem:>20,.0f}")
+    print(f"  PV CF / APE        : {pvcf_over_ape:>20.4f}")
+    print(f"  PV CF / PV Prem    : {pvcf_over_pv_prem:>20.4f}")
+    # print(f"  Total Prem Inc     : {total_prem:>20,.0f}")
+    # print(f"  Total Death Outgo  : {total_death:>20,.0f}")
+    # print(f"  Total Surr Outgo   : {total_surr:>20,.0f}")
+    print(f"{'='*60}\n")
+
+
+# ---------------------------------------------------------------------------
+# Summary output
+# ---------------------------------------------------------------------------
+
+def write_summary_outputs(
+    summary_data: dict,
+    scenario_id: int,
+    output_dir: str,
+    n_scenarios: int = 1,
+) -> None:
+    """Write summary (batch-aggregated) outputs to CSV.
+
+    Parameters
+    ----------
+    summary_data : dict of {key: [T] tensor}
+    scenario_id  : integer scenario identifier
+    output_dir   : directory path for output files
+    n_scenarios  : total number of scenarios (used for file naming)
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    n_digits = len(str(n_scenarios))
+    fname = out_path / f"summary_scen{scenario_id:0{n_digits}d}.csv"
+
+    keys = list(summary_data.keys())
+    T = max(v.shape[0] for v in summary_data.values() if hasattr(v, "shape"))
+
+    with open(fname, "w", newline="", encoding="utf-8") as f:
+        # Header
+        f.write("t," + ",".join(keys) + "\n")
+        for t in range(T):
+            row = [str(t)]
+            for k in keys:
+                v = summary_data[k]
+                row.append(f"{float(v[t]):.6f}" if t < v.shape[0] else "0")
+            f.write(",".join(row) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Per-policy output
+# ---------------------------------------------------------------------------
+
+def write_per_policy_outputs(
+    all_outputs: dict,
+    policy_ids: torch.Tensor,
+    output_keys: list[str],
+    scenario_id: int,
+    output_dir: str,
+    n_scenarios: int = 1,
+) -> None:
+    """Write per-policy outputs to a single CSV file.
+
+    Format: policy_id, t, then all output_keys variables.
+    Each policy has T rows (one per time step).
+
+    Parameters
+    ----------
+    all_outputs     : merged dict of all part outputs {key: [B, T] tensor}
+    policy_ids      : [B] tensor of policy IDs
+    output_keys     : ordered list of variable names to write
+    scenario_id     : integer scenario identifier
+    output_dir      : directory path for output files
+    n_scenarios     : total number of scenarios (used for file naming)
+    """
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    n_digits = len(str(n_scenarios))
+    fname = out_path / f"per_policy_scen{scenario_id:0{n_digits}d}.csv"
+
+    B = policy_ids.shape[0]
+    T = max(v.shape[1] for v in all_outputs.values() if hasattr(v, "shape") and v.ndim == 2)
+
+    with open(fname, "w", newline="", encoding="utf-8") as f:
+        header = ["policy_id", "t"] + output_keys
+        f.write(",".join(header) + "\n")
+
+        for b in range(B):
+            pid = int(policy_ids[b])
+            for t in range(T):
+                row = [str(pid), str(t)]
+                for k in output_keys:
+                    if k in all_outputs:
+                        v = all_outputs[k]
+                        if v.ndim == 2 and t < v.shape[1]:
+                            row.append(f"{float(v[b, t]):.6f}")
+                        else:
+                            row.append("0")
+                    else:
+                        row.append("0")
+                f.write(",".join(row) + "\n")
