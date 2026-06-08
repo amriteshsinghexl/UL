@@ -35,6 +35,11 @@ import sys
 import time
 from pathlib import Path
 
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -308,7 +313,22 @@ def main() -> int:
                 output_dir=config.output_dir,
                 n_scenarios=len(scenarios),
             )
-            print(f"  Summary output  → {Path(config.output_dir) / fname_summary}")
+            csv_path = Path(config.output_dir) / fname_summary
+            print(f"  Summary output  → {csv_path}")
+
+            # Generate Excel workbook with embedded actuarial formulas
+            xlsx_name = fname_summary.replace(".csv", "_formulas.xlsx")
+            xlsx_path = Path(config.output_dir) / xlsx_name
+            try:
+                from app.formula_extractor import get_formula_map
+                from app.excel_generator import build_excel
+                xlsx_bytes = build_excel(csv_path, get_formula_map())
+                xlsx_path.write_bytes(xlsx_bytes)
+                print(f"  Formula workbook → {xlsx_path}")
+            except RuntimeError as exc:
+                print(f"  [WARNING] Excel generation skipped: {exc}")
+            except ImportError as exc:
+                print(f"  [WARNING] Excel generation skipped (missing dependency): {exc}")
 
         # Write per-policy outputs
         if config.output_mode in ("per_policy", "both"):
